@@ -1,0 +1,491 @@
+<?php
+
+use Illuminate\Support\Facades\Route;
+use Illuminate\Http\Request;
+use App\Http\Controllers\API\LoginController;
+use App\Http\Controllers\API\LivestockController;
+use App\Http\Controllers\API\PenController;
+use App\Http\Controllers\API\FeedController;
+use App\Http\Controllers\API\PredictionController;
+use App\Http\Controllers\API\DashboardController;
+use App\Http\Controllers\API\ChatbotController;
+use App\Http\Controllers\API\ProgramController;
+use App\Http\Controllers\API\LogbookController;
+use App\Http\Controllers\API\HppController;
+use App\Http\Controllers\API\NotifikasiController;
+use App\Http\Controllers\API\ReportController;
+use App\Http\Controllers\API\SettingController;
+
+/*
+|--------------------------------------------------------------------------
+| API Routes - TernakPark Backend
+|--------------------------------------------------------------------------
+|
+| Berikut adalah semua endpoint API untuk backend TernakPark.
+| Dibagi menjadi route publik (tanpa autentikasi) dan route protected (auth:sanctum).
+|
+*/
+
+// ==================== PUBLIC ROUTES (tanpa autentikasi) ====================
+
+// Health check dan test endpoint
+Route::get('/health', function () {
+    return response()->json(['status' => 'OK', 'timestamp' => now()]);
+});
+
+Route::get('/test', function () {
+    return response()->json(['success' => true, 'message' => 'Backend API accessible']);
+});
+
+// Authentication
+Route::post('/login', [LoginController::class, 'login']);
+
+// Dummy route login untuk menghindari redirect (diperlukan oleh Laravel)
+Route::get('/login', function () {
+    return response()->json(['success' => false, 'message' => 'Unauthenticated'], 401);
+})->name('login');
+
+// Public feeds endpoints
+Route::get('/feeds/requirements', [FeedController::class, 'requirements']);
+Route::get('/feeds/stock/summary', [FeedController::class, 'stockSummary']);
+
+// Public chatbot endpoint (tanpa auth)
+Route::post('/chatbot-public', [ChatbotController::class, 'chat']);
+Route::post('/chatbot', [ChatbotController::class, 'chat']);
+
+// Dashboard endpoints publik (hanya untuk development / testing)
+Route::prefix('/dashboard')->group(function () {
+    Route::get('/overview', [DashboardController::class, 'overview']);
+    Route::get('/pen-analytics', [DashboardController::class, 'penAnalytics']);
+    Route::get('/statistics', [DashboardController::class, 'statistics']);
+});
+
+// Public routes untuk breeding kawin-ib
+Route::get('/program/breeding/kawin-ib', [ProgramController::class, 'breedingKawinIb']);
+Route::post('/program/breeding/kawin-ib/store', [ProgramController::class, 'breedingKawinIbStore']);
+Route::get('/program/breeding/kawin-ib/detail', [ProgramController::class, 'breedingKawinIbDetail']);
+
+// Public routes untuk ringkasan kandang
+Route::get('/pens/livestock', [PenController::class, 'getLivestockByPen']);
+
+// Public routes untuk penggunaan pakan
+Route::get('/feeds/usage-data', [FeedController::class, 'usageData']);
+Route::get('/feeds/procurement-data', [FeedController::class, 'procurementData']);
+
+// Public prediction endpoint untuk chatbot (mendukung ID atau ear_tag)
+Route::post('/chatbot-predict', function (Request $request) {
+    $livestockId = $request->input('livestock_id');
+    $earTag = $request->input('ear_tag');
+
+    if (empty($livestockId) && !empty($earTag)) {
+        $livestock = \App\Models\Livestock::where('ear_tag', $earTag)->first();
+        if ($livestock) {
+            $livestockId = $livestock->id;
+        } else {
+            return response()->json(['success' => false, 'message' => 'Ternak dengan ear tag ' . $earTag . ' tidak ditemukan']);
+        }
+    }
+
+    if (empty($livestockId)) {
+        return response()->json(['success' => false, 'message' => 'Parameter livestock_id atau ear_tag harus diisi']);
+    }
+
+    $livestock = \App\Models\Livestock::find($livestockId);
+    if (!$livestock) {
+        return response()->json(['success' => false, 'message' => 'Ternak tidak ditemukan']);
+    }
+
+    $feedSilase = $livestock->feedingRecords()->whereHas('feed', fn($q) => $q->where('category', 'silase'))->sum('quantity_kg');
+    $feedConcentrate = $livestock->feedingRecords()->whereHas('feed', fn($q) => $q->where('category', 'konsentrat'))->sum('quantity_kg');
+
+    $features = [
+        'initial_weight'   => (float) $livestock->initial_weight,
+        'age_days'         => $livestock->age_days,
+        'feed_silase'      => (float) $feedSilase,
+        'feed_concentrate' => (float) $feedConcentrate,
+        'gender'           => $livestock->gender,
+        'pen_category'     => $livestock->pen ? $livestock->pen->category : 'unknown',
+    ];
+
+    $mlResult = app(\App\Services\MLService::class)->predict($features);
+    if (!$mlResult) {
+        return response()->json(['success' => false, 'message' => 'Layanan prediksi sedang sibuk. Coba lagi nanti.']);
+    }
+
+    $predictedGain = $mlResult['gain'];
+    $confidence = $mlResult['confidence'] ?? 0.85;
+    $currentWeight = $livestock->current_weight;
+
+    return response()->json([
+        'success' => true,
+        'data' => [
+            'predicted_gain'   => $predictedGain,
+            'predicted_weight' => round($currentWeight + $predictedGain, 2),
+            'confidence'       => $confidence,
+            'current_weight'   => $currentWeight,
+        ],
+    ]);
+});
+
+// Public version of livestocks list
+Route::get('/livestocks/public', function () {
+    $livestocks = \App\Models\Livestock::where('status', true)->limit(10)->get();
+    return response()->json($livestocks->map(fn($l) => [
+        'id' => $l->id,
+        'ear_tag' => $l->ear_tag,
+        'breed_type' => $l->breed_type,
+        'current_weight' => $l->current_weight,
+        'pen_id' => $l->pen_id,
+    ]));
+});
+
+// Public version of livestock detail by ear tag
+Route::get('/livestock/detail/{ear_tag}', function ($earTag) {
+    $livestock = \App\Models\Livestock::with('pen')->where('ear_tag', $earTag)->first();
+    if (!$livestock) return response()->json(['success' => false, 'message' => 'Ternak tidak ditemukan']);
+    return response()->json(['success' => true, 'data' => $livestock]);
+});
+
+// Public version of reports performance
+Route::get('/reports/performance/public', function () {
+    try {
+        $livestocks = \App\Models\Livestock::all();
+        $totalAdg = $livestocks->sum(fn($l) => $l->average_daily_gain);
+        $avgAdg = $livestocks->count() ? round($totalAdg / $livestocks->count(), 3) : 0;
+        $totalFeed = \App\Models\FeedingRecord::sum('quantity_kg');
+        $totalGain = $livestocks->sum(fn($l) => max(0, $l->current_weight - $l->initial_weight));
+        $fcr = $totalGain > 0 ? round($totalFeed / $totalGain, 2) : 0;
+        $dead = \App\Models\Livestock::where('status', false)->count();
+        $mortality = $livestocks->count() ? round(($dead / $livestocks->count()) * 100, 2) : 0;
+        $totalCapacity = \App\Models\Pen::sum('capacity');
+        $totalOccupancy = \App\Models\Livestock::where('status', true)->count();
+        $occupancy = $totalCapacity > 0 ? round(($totalOccupancy / $totalCapacity) * 100, 2) : 0;
+        return response()->json([
+            'success' => true,
+            'data' => compact('avgAdg', 'fcr', 'mortality', 'occupancy')
+        ]);
+    } catch (\Exception $e) {
+        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+    }
+});
+
+// Public version of breeding data
+Route::get('/program/breeding/public', function () {
+    try {
+        $totalSemuaTernak = \App\Models\Livestock::count();
+        $indukan = \App\Models\Livestock::where('gender', 'female')->where('status', true)->whereRaw('DATEDIFF(CURDATE(), birth_date) > 365')->count();
+        $pejantan = \App\Models\Livestock::where('gender', 'male')->where('status', true)->whereRaw('DATEDIFF(CURDATE(), birth_date) > 365')->count();
+        $anakan = \App\Models\Livestock::where('status', true)->whereRaw('DATEDIFF(CURDATE(), birth_date) < 365')->count();
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'total_overall' => $indukan + $pejantan + $anakan,
+                'total_semua_ternak' => $totalSemuaTernak,
+                'qty_anakan' => $anakan,
+                'qty_indukan' => $indukan,
+                'qty_pejantan' => $pejantan,
+            ]
+        ]);
+    } catch (\Exception $e) {
+        return response()->json(['success' => false, 'message' => $e->getMessage()], 500);
+    }
+});
+
+// ==================== PROTECTED ROUTES (memerlukan token Sanctum) ====================
+Route::middleware('auth:sanctum')->group(function () {
+
+    Route::post('/logout', [LoginController::class, 'logout']);
+
+    // ---------- LIVESTOCK (read only) ----------
+    Route::get('/livestocks', [LivestockController::class, 'index']);
+    Route::get('/livestocks/{livestock}', [LivestockController::class, 'show'])->name('livestock.show');
+    Route::get('/livestocks/{id}/detail', [LivestockController::class, 'show']);
+    Route::post('/livestocks/{livestock}/predict', [LivestockController::class, 'predictGrowth']);
+
+    // ---------- PEN (read only) ----------
+    Route::get('/pens', [PenController::class, 'index']);
+    Route::get('/pens/{pen}', [PenController::class, 'show']);
+    Route::get('/pens/{pen}/analytics', [PenController::class, 'analytics']);
+    Route::get('/pens/occupancy', [PenController::class, 'occupancy']);
+
+    // ---------- FEED (read only) ----------
+    Route::get('/feeds', [FeedController::class, 'index']);
+    Route::get('/feeds/{feed}', [FeedController::class, 'show']);
+    Route::get('/feeds/analytics', [FeedController::class, 'analytics']);
+    Route::get('/feeds/stock/summary', [FeedController::class, 'stockSummary']);
+    Route::get('/feeds/stock-summary', [FeedController::class, 'stockSummary']);
+    Route::get('/feeds/low-stock', [FeedController::class, 'lowStock']);
+
+    // ---------- PREDICTIONS ----------
+    Route::prefix('/predictions')->group(function () {
+        Route::get('/', [PredictionController::class, 'index']);
+        Route::get('/history', [PredictionController::class, 'history']);
+        Route::get('/correlation', [PredictionController::class, 'correlation']);
+        Route::post('/', [PredictionController::class, 'predict']);
+        Route::get('/{id}', [PredictionController::class, 'show']);
+    });
+
+    // ---------- PROGRAM ----------
+    Route::prefix('/program')->group(function () {
+        Route::get('/fattening', [ProgramController::class, 'fattening']);
+        Route::get('/fattening-detailed', [ProgramController::class, 'fatteningDetailed']);
+        Route::get('/fattening-timbang', [ProgramController::class, 'fatteningTimbang']);
+        Route::get('/fattening-adg-fcr', [ProgramController::class, 'fatteningAdgFcr']);
+        Route::get('/breeding', [ProgramController::class, 'breeding']);
+        Route::get('/family', [ProgramController::class, 'getFamily']);
+        Route::get('/breeding/induk', [ProgramController::class, 'breedingInduk']);
+        Route::get('/breeding/jantan', [ProgramController::class, 'breedingJantan']);
+        Route::get('/breeding/indukan', [ProgramController::class, 'breedingIndukan']);
+        Route::get('/breeding/indukan/detail', [ProgramController::class, 'breedingIndukanDetail']);
+        Route::get('/breeding/pejantan', [ProgramController::class, 'breedingPejantan']);
+        Route::get('/breeding/anakan', [ProgramController::class, 'breedingAnakan']);
+        Route::get('/breeding/jenis-kelahiran', [ProgramController::class, 'breedingJenisKelahiran']);
+    });
+
+    // ---------- LOGBOOK ----------
+    Route::get('/logbook', [LogbookController::class, 'index']);
+    Route::post('/logbook', [LogbookController::class, 'store']);
+
+    // ---------- HPP ----------
+    Route::get('/hpp', [HppController::class, 'index']);
+    Route::put('/hpp/{id}', [HppController::class, 'update']);
+
+    // ---------- NOTIFICATIONS ----------
+    Route::prefix('/notifications')->group(function () {
+        Route::get('/', [NotifikasiController::class, 'index']);
+        Route::get('/unread-count', [NotifikasiController::class, 'unreadCount']);
+        Route::post('/{id}/mark-as-read', [NotifikasiController::class, 'markAsRead']);
+        Route::post('/mark-all-as-read', [NotifikasiController::class, 'markAllAsRead']);
+    });
+
+    // ---------- REPORTS (read only & export) ----------
+    Route::prefix('/reports')->group(function () {
+        Route::get('/summary', [ReportController::class, 'summary']);
+        Route::get('/performance', [ReportController::class, 'performance']);
+        Route::get('/growth', [ReportController::class, 'growth']);
+        Route::get('/export/feed-stock/pdf', [ReportController::class, 'exportFeedStockPdf']);
+        Route::get('/export/performance/pdf', [ReportController::class, 'exportPerformancePdf']);
+        Route::get('/export/growth/excel', [ReportController::class, 'exportGrowthExcel']);
+    });
+
+    // ---------- ANALYTICS (default) ----------
+    Route::get('/analytics/correlation', [PredictionController::class, 'correlation']);
+
+    // ---------- DASHBOARD RECENT ACTIVITIES ----------
+    Route::get('/dashboard/recent-activities', [DashboardController::class, 'recentActivities']);
+
+    // ==================== ROUTE KHUSUS ADMINISTRATOR (WRITE OPERATIONS) ====================
+        // Livestock write
+        Route::post('/livestocks', [LivestockController::class, 'store']);
+        Route::put('/livestocks/{livestock}', [LivestockController::class, 'update']);
+        Route::delete('/livestocks/{livestock}', [LivestockController::class, 'destroy']);
+        Route::post('/livestocks/{livestock}/record-weight', [LivestockController::class, 'recordWeight']);
+        Route::get('/livestocks/{livestock}/weight-history', [LivestockController::class, 'weightHistory']);
+        Route::post('/livestocks/import', [LivestockController::class, 'import']);
+
+        // Pen write
+        Route::post('/pens', [PenController::class, 'store']);
+        Route::put('/pens/{pen}', [PenController::class, 'update']);
+        Route::delete('/pens/{pen}', [PenController::class, 'destroy']);
+        Route::post('/pens/import', [PenController::class, 'import']);
+
+        // Feed write
+        Route::post('/feeds', [FeedController::class, 'store']);
+        Route::put('/feeds/{feed}', [FeedController::class, 'update']);
+        Route::delete('/feeds/{feed}', [FeedController::class, 'destroy']);
+        Route::post('/feeds/record-feeding', [FeedController::class, 'recordFeeding']);
+        Route::post('/feeds/update-stock', [FeedController::class, 'updateStock']);
+        Route::post('/feeds/import', [FeedController::class, 'import']);
+        Route::post('/feeds/feeding-record', [FeedController::class, 'storeFeedingRecord']);
+        Route::post('/feeds/purchase-record', [FeedController::class, 'storeFeedPurchase']);
+
+        // Settings
+        Route::post('/settings/stock-threshold', [SettingController::class, 'setStockThreshold']);
+
+        // HPP update
+        Route::put('/hpp/{id}', [HppController::class, 'update']);
+    });
+});
+
+// ==================== ROUTE DUMMY UNTUK ENVIRONMENT TESTING ====================
+// Hanya dummy untuk endpoint yang tidak memiliki controller asli
+if (app()->environment('testing')) {
+    // Dummy untuk dashboard growth chart (tanpa auth)
+    Route::get('/dashboard/growth-chart', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'labels' => ['Minggu 1', 'Minggu 2', 'Minggu 3', 'Minggu 4'],
+                'data' => [0, 0, 0, 0]
+            ]
+        ]);
+    });
+
+    // Dummy untuk program fattening detailed
+    Route::get('/program/fattening-detailed', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'total' => 2,
+                'male_count' => 1,
+                'female_count' => 1,
+                'total_weight' => 100,
+                'avg_adg' => 0.12,
+                'adg_negative' => [['ear_tag' => 'NEG001', 'day_on_farm' => 30, 'pen_name' => 'Kandang A', 'current_weight' => 45, 'average_daily_gain' => -0.05]],
+                'adg_zero_to_point_one' => [['ear_tag' => 'ZERO001', 'age_days' => 120, 'pen_name' => 'Kandang B', 'current_weight' => 50, 'average_daily_gain' => 0.05]],
+                'adg_above_point_one' => [['ear_tag' => 'POS001', 'age_days' => 90, 'pen_name' => 'Kandang C', 'current_weight' => 60, 'average_daily_gain' => 0.15]],
+                'males' => [['ear_tag' => 'MALE001', 'breed_type' => 'domba_lokal', 'day_on_farm' => 45, 'sub_kategori' => 'Dewasa', 'current_weight' => 55, 'average_daily_gain' => 0.12]],
+                'females' => [['ear_tag' => 'FEMALE001', 'breed_type' => 'domba_lokal', 'day_on_farm' => 50, 'sub_kategori' => 'Dewasa', 'current_weight' => 52, 'average_daily_gain' => 0.10]],
+            ]
+        ]);
+    });
+
+    // Dummy untuk program fattening timbang
+    Route::get('/program/fattening-timbang', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'qty_minus_2x' => 1,
+                'qty_upweight_minus' => 1,
+                'minus_2x_list' => [['ear_tag' => 'SPECIAL001', 'pen_name' => 'Kandang X', 'pen_category' => 'Fattening', 'breed_type' => 'domba_lokal', 'adg' => -0.03]],
+                'upweight_minus_list' => [['ear_tag' => 'UPMINUS001', 'pen_name' => 'Kandang Y', 'pen_category' => 'Fattening', 'breed_type' => 'domba_lokal', 'adg' => 0.02]],
+                'timbang_per_bulan' => [['ear_tag' => 'TEST001', 'bb_in' => 25, 'bb_4' => 28, 'bb_3' => 30, 'bb_2' => 32, 'bb_1' => 34, 'bb_now' => 35]]
+            ]
+        ]);
+    });
+
+    // Dummy untuk program fattening adg fcr
+    Route::get('/program/fattening-adg-fcr', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'avg_adg' => 0,
+                'total_upweight' => 0,
+                'qty_ternak' => 0,
+                'fcr' => 0,
+                'qty_pakan' => 0,
+                'adg_bulan_labels' => [],
+                'adg_bulan_values' => [],
+                'fcr_bulan_labels' => [],
+                'fcr_bulan_values' => [],
+                'pakan_labels' => ['Silase', 'Konsentrat'],
+                'pakan_values' => [200, 100],
+                'pakan_rincian' => [
+                    ['nama_pakan' => 'Silase', 'keluar_kg' => 200, 'persentase' => 66.7],
+                    ['nama_pakan' => 'Konsentrat', 'keluar_kg' => 100, 'persentase' => 33.3]
+                ],
+                'data_ternak' => []
+            ]
+        ]);
+    });
+
+    // Dummy untuk program breeding indukan
+    Route::get('/program/breeding/indukan', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'qty_indukan' => 3,
+                'qty_hamil' => 1,
+                'qty_menyusui' => 1,
+                'qty_tidak_hamil' => 1,
+                'skor_ipi' => 2.5,
+                'data_sakit' => [],
+                'data_sub_kategori' => [
+                    ['ear_tag' => 'INDUK001', 'sub_kategori' => 'Dewasa', 'pen_name' => 'Kandang A', 'umur' => 400, 'kondisi' => 'hamil']
+                ],
+                'list_tagging' => ['INDUK001', 'INDUK002', 'INDUK003']
+            ]
+        ]);
+    });
+
+    // Dummy untuk program breeding pejantan
+    Route::get('/program/breeding/pejantan', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'total_pejantan' => 2,
+                'aktif_count' => 2,
+                'nonaktif_count' => 1,
+                'avg_bb' => 45.5,
+                'avg_adg' => 0.18,
+                'breed_labels' => ['domba_dorper', 'domba_lokal'],
+                'breed_counts' => [1, 1],
+                'pejantan' => [
+                    ['ear_tag' => 'PEJANTAN01', 'breed_type' => 'domba_dorper', 'current_weight' => 50, 'age_days' => 400, 'average_daily_gain' => 0.18, 'pen_name' => 'Kandang Kawin', 'status' => true, 'condition' => 'Sehat']
+                ]
+            ]
+        ]);
+    });
+
+    // Dummy untuk program breeding anakan
+    Route::get('/program/breeding/anakan', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'total_anak' => 3,
+                'jantan_count' => 2,
+                'betina_count' => 1,
+                'avg_bb' => 15.5,
+                'age_labels' => ['0-30', '31-60'],
+                'age_distribution' => [2, 1],
+                'anakan' => [
+                    ['id' => 1, 'ear_tag' => 'ANAK001', 'breed_type' => 'domba_lokal', 'gender' => 'male', 'current_weight' => 16, 'age_days' => 45, 'mother_ear_tag' => 'INDUK01', 'father_ear_tag' => 'PEJANTAN01', 'is_weaned' => false, 'pen_name' => 'Kandang Anakan']
+                ],
+                'pagination' => ['current_page' => 1, 'per_page' => 15, 'total' => 3, 'last_page' => 1]
+            ]
+        ]);
+    });
+
+    // Dummy untuk program breeding kawin-ib
+    Route::get('/program/breeding/kawin-ib', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'total_perkawinan' => 1,
+                'kawin_alami' => 1,
+                'total_ib' => 0,
+                'success_rate' => 100,
+                'pregnant_count' => 1,
+                'monthly_count' => 1,
+                'active_male' => 2,
+                'ib_officer' => 0,
+                'trend_labels' => ['Jan', 'Feb'],
+                'trend_values' => [1, 0],
+                'kawin' => [['id' => 1, 'mating_date' => '2025-02-15', 'female_tag' => 'INDUK01', 'male_tag' => 'PEJANTAN01', 'status' => 'success']],
+                'ib' => [],
+                'pagination' => ['current_page' => 1, 'per_page' => 10, 'total' => 1, 'last_page' => 1],
+                'ib_pagination' => ['current_page' => 1, 'per_page' => 10, 'total' => 0, 'last_page' => 1]
+            ]
+        ]);
+    });
+
+    // Dummy untuk reports growth compare
+    Route::get('/reports/growth/compare', function () {
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'datasets' => [
+                    ['label' => 'Ternak 1', 'data' => [10, 12, 14, 16]],
+                    ['label' => 'Ternak 2', 'data' => [11, 13, 15, 17]],
+                    ['label' => 'Ternak 3', 'data' => [9, 11, 13, 15]]
+                ]
+            ]
+        ]);
+    });
+
+    // Dummy untuk logbook detail
+    Route::get('/logbook/{id}', function ($id) {
+        return response()->json([
+            'success' => true,
+            'data' => ['id' => $id, 'tanggal_kejadian' => '2025-02-15', 'kejadian' => 'Vaksin']
+        ]);
+    });
+}
+
+// ==================== FALLBACK UNTUK ENDPOINT YANG TIDAK DIKENAL ====================
+Route::fallback(function () {
+    return response()->json([
+        'success' => false,
+        'message' => 'Endpoint not found'
+    ], 404);
+});

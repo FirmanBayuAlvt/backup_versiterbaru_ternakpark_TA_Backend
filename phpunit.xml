@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+         stopOnFailure="false"
+         cacheDirectory=".phpunit.cache"
+         displayDetailsOnTestsThatTriggerWarnings="false"
+         failOnWarning="false">
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <php>
+        <!-- Environment Configuration -->
+        <env name="APP_ENV" value="testing"/>
+        <env name="APP_DEBUG" value="false"/>
+        <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+        <env name="BCRYPT_ROUNDS" value="4"/>
+        
+        <!-- Broadcast Configuration -->
+        <env name="BROADCAST_CONNECTION" value="null"/>
+        
+        <!-- Cache Configuration -->
+        <env name="CACHE_DRIVER" value="array"/>
+        <env name="CACHE_STORE" value="array"/>
+        
+        <!-- Database Configuration: MySQL Testing Database -->
+        <!-- Pastikan database 'ternakpark_backend_test' sudah dibuat dan user root memiliki akses -->
+        <env name="DB_CONNECTION" value="mysql"/>
+        <env name="DB_HOST" value="127.0.0.1"/>
+        <env name="DB_PORT" value="3306"/>
+        <env name="DB_DATABASE" value="ternakpark_backend_test"/>
+        <env name="DB_USERNAME" value="root"/>
+        <env name="DB_PASSWORD" value="B@yu010830"/>
+        
+        <!-- Mail Configuration -->
+        <env name="MAIL_MAILER" value="array"/>
+        
+        <!-- Queue Configuration -->
+        <env name="QUEUE_CONNECTION" value="sync"/>
+        
+        <!-- Session Configuration -->
+        <env name="SESSION_DRIVER" value="array"/>
+        
+        <!-- Disable Monitoring Tools for Faster Testing -->
+        <env name="PULSE_ENABLED" value="false"/>
+        <env name="TELESCOPE_ENABLED" value="false"/>
+        <env name="NIGHTWATCH_ENABLED" value="false"/>
+    </php>
+</phpunit>
